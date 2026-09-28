@@ -9,7 +9,6 @@ from streamlit_folium import st_folium
 import requests
 import time
 from datetime import datetime
-import random
 import json
 from logic.dala_estimator import estimate_dataframe, format_rupiah, parse_numeric, total_numeric
 
@@ -164,9 +163,75 @@ def display_frame(dataframe):
     return renamed.loc[:, ~renamed.columns.duplicated()]
 
 
-KABUPATEN = ["Denpasar", "Badung", "Gianyar", "Tabanan", "Buleleng", "Karangasem", "Klungkung", "Bangli", "Jembrana"]
-SEKTOR = ["Pemukiman", "Infrastruktur", "Ekonomi", "Sosial", "Lintas Sektor"]
-SEVERITY = ["Berat", "Sedang", "Ringan"]
+SEVERITY_LEVELS = ["Berat", "Sedang", "Ringan", "Tidak terdampak", "Belum diklasifikasikan"]
+SEVERITY_COLORS = {
+    "Berat": "#ef4444", "Sedang": "#f59e0b", "Ringan": "#10b981",
+    "Tidak terdampak": "#94a3b8", "Belum diklasifikasikan": "#475569",
+}
+UNKNOWN_LABEL = "Tidak tercantum"
+
+
+def classify_severity(value):
+    """Kelompokkan tingkat kerusakan input (teks atau persen) ke Berat/Sedang/Ringan."""
+    text = str(value if value is not None else '').strip().casefold()
+    if not text or text in ('nan', 'none', 'null', '-'):
+        return "Belum diklasifikasikan"
+    if any(term in text for term in ('tidak terdampak', 'tidak rusak', 'tidak ada kerusakan', 'nihil')):
+        return "Tidak terdampak"
+    if any(term in text for term in ('berat', 'roboh', 'terbakar habis', 'hancur', 'parah', 'heavy', 'severe')):
+        return "Berat"
+    if any(term in text for term in ('sedang', 'medium', 'moderate')):
+        return "Sedang"
+    if any(term in text for term in ('ringan', 'light', 'minor', 'slight')):
+        return "Ringan"
+    ratio = parse_numeric(value)
+    if ratio is not None:
+        ratio = ratio / 100 if ratio > 1 else ratio
+        # Batas kelas JITUPASNA: ringan <= 30%, sedang 31-70%, berat > 70%
+        return "Berat" if ratio > 0.70 else "Sedang" if ratio > 0.30 else "Ringan" if ratio > 0 else "Tidak terdampak"
+    return "Belum diklasifikasikan"
+
+
+def label_column(dataframe, column):
+    """Nilai kolom siap dikelompokkan: teks rapi, kosong menjadi 'Tidak tercantum'."""
+    if column not in dataframe:
+        return pd.Series(UNKNOWN_LABEL, index=dataframe.index)
+    labels = dataframe[column].astype('string').str.strip()
+    return labels.mask(labels.isna() | labels.isin(['', 'nan', 'None']), UNKNOWN_LABEL).astype(str)
+
+
+def region_label(dataframe):
+    """Nama kabupaten/kota yang diseragamkan (BADUNG, Kab. Badung -> Badung)."""
+    labels = label_column(dataframe, 'Kabupaten')
+    cleaned = labels.str.replace(r'(?i)^\s*(kabupaten|kab\.?|kota)\s+', '', regex=True).str.strip().str.title()
+    return cleaned.where(labels != UNKNOWN_LABEL, UNKNOWN_LABEL)
+
+
+def summarize_estimates(dataframe, group_column):
+    """Jumlah data, unit, kerusakan, dan kerugian per kelompok dari data aktif."""
+    grouped = dataframe.assign(
+        _unit=dataframe['Jumlah Terkena'].map(parse_numeric) if 'Jumlah Terkena' in dataframe else None,
+        _kerusakan=pd.to_numeric(dataframe['_estimasi_kerusakan_numeric'], errors='coerce'),
+        _kerugian=pd.to_numeric(dataframe['_kerugian_unit_numeric'], errors='coerce'),
+    ).groupby(group_column, dropna=False)
+    summary = pd.DataFrame({
+        'Jumlah Data': grouped.size(),
+        'Unit Terdampak': grouped['_unit'].sum(min_count=1),
+        'Kerusakan (Rp)': grouped['_kerusakan'].sum(min_count=1),
+        'Kerugian (Rp)': grouped['_kerugian'].sum(min_count=1),
+    })
+    summary['Total Kerusakan + Kerugian (Rp)'] = summary[['Kerusakan (Rp)', 'Kerugian (Rp)']].sum(axis=1, min_count=1)
+    return summary.reset_index().sort_values('Jumlah Data', ascending=False)
+
+
+def style_chart(figure, height=None):
+    figure.update_layout(
+        plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)", font_color="#e2e8f0",
+        title_font_family="Space Mono", legend_title_text='', separators=',.',
+    )
+    if height:
+        figure.update_layout(height=height)
+    return figure
 
 # ==========================================
 # HEADER SECTION
@@ -233,6 +298,11 @@ with st.sidebar:
         'Jenis Kejadian / Bencana': ('Jenis Kejadian', 'Jenis Bencana', 'Disaster Type', 'Kejadian'),
         'Jumlah Terkena': ('Jumlah Terdampak', 'Jumlah Unit', 'Affected Quantity', 'Jumlah'),
         'Tingkat_Kerusakan': ('Tingkat Kerusakan', 'Damage Level', 'Kerusakan'),
+        'Kecamatan': ('Kec', 'Kec.', 'Subdistrict'),
+        'Desa': ('Desa/Kelurahan', 'Kelurahan', 'Village'),
+        'Latitude': ('Lat', 'Lintang'),
+        'Longitude': ('Lon', 'Long', 'Lng', 'Bujur'),
+        'Aset': ('Nama Aset', 'Asset', 'Objek'),
     }.items():
         normalize_column(source_df, target, aliases)
 
@@ -265,6 +335,10 @@ if date_column and isinstance(date_filter, (tuple, list)) and len(date_filter) =
     df_aktif = df_aktif[event_dates.between(date_filter[0], date_filter[1])].copy()
 
 df_terbaru = estimate_dataframe(df_aktif)
+df_terbaru['_tingkat'] = df_terbaru['Tingkat_Kerusakan'].map(classify_severity) if len(df_terbaru) else pd.Series(dtype=str)
+df_terbaru['_wilayah'] = region_label(df_terbaru)
+df_terbaru['_sektor'] = label_column(df_terbaru, 'Sektor')
+df_terbaru['_jenis'] = label_column(df_terbaru, 'Jenis Kejadian / Bencana')
 damage_total, damage_count = total_numeric(df_terbaru, '_estimasi_kerusakan_numeric')
 loss_total, loss_count = total_numeric(df_terbaru, '_kerugian_unit_numeric')
 st.sidebar.markdown('---')
@@ -298,10 +372,7 @@ with tab1:
         affected_units = parsed_quantities.sum() if not parsed_quantities.empty else total_rows
     else:
         affected_units = total_rows
-    severe_count = (
-        df_terbaru['Tingkat_Kerusakan'].astype(str).str.contains('berat|roboh|terbakar habis', case=False, na=False).sum()
-        if 'Tingkat_Kerusakan' in df_terbaru else 0
-    )
+    severe_count = int((df_terbaru['_tingkat'] == 'Berat').sum())
     coverage_text = f'{damage_count}/{total_rows} data terhitung'
     damage_card_value = f'{format_rupiah(damage_total)} ({coverage_text})' if total_rows else 'Belum ada data'
     loss_card_value = f'{format_rupiah(loss_total)} ({loss_count}/{total_rows} data terhitung)' if total_rows else 'Belum ada data'
@@ -371,54 +442,93 @@ Baris yang datanya belum lengkap tidak dianggap Rp 0; alasannya tercantum di kol
         
     st.markdown("<br>", unsafe_allow_html=True)
     
+    estimate_colors = {'Kerusakan (Rp)': '#4a90e2', 'Kerugian (Rp)': '#f59e0b'}
+
+    def estimate_bar(summary, category, title, horizontal=False):
+        long_form = summary.melt(
+            id_vars=[category, 'Jumlah Data'], value_vars=['Kerusakan (Rp)', 'Kerugian (Rp)'],
+            var_name='Komponen', value_name='Nilai (Rp)',
+        ).dropna(subset=['Nilai (Rp)'])
+        axes = dict(y=category, x='Nilai (Rp)', orientation='h') if horizontal else dict(x=category, y='Nilai (Rp)')
+        figure = px.bar(
+            long_form, **axes, color='Komponen', barmode='group', title=title,
+            hover_data={'Jumlah Data': True}, color_discrete_map=estimate_colors,
+        )
+        if horizontal:
+            figure.update_yaxes(categoryorder='total ascending')
+        return style_chart(figure)
+
     # Charts Row 1
     c1, c2 = st.columns(2)
     with c1:
-        if total_rows and '_estimasi_kerusakan_numeric' in df_terbaru:
-            df_sektor = (
-                df_terbaru.groupby('Sektor', dropna=False)['_estimasi_kerusakan_numeric']
-                .sum(min_count=1).dropna().rename('Kerusakan (Rp)')
-                .reset_index().sort_values('Kerusakan (Rp)', ascending=False)
-            )
-            if not df_sektor.empty:
-                fig_bar = px.bar(df_sektor, x='Sektor', y='Kerusakan (Rp)', title='Estimasi Kerusakan Berdasarkan Sektor', color_discrete_sequence=['#4a90e2'])
-                fig_bar.update_layout(plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)", font_color="#e2e8f0", title_font_family="Space Mono")
-                st.plotly_chart(fig_bar, use_container_width=True)
-            else:
-                st.info('Belum ada nilai estimasi kerusakan yang dapat dikelompokkan per sektor.')
+        df_sektor = summarize_estimates(df_terbaru, '_sektor').rename(columns={'_sektor': 'Sektor'}) if total_rows else pd.DataFrame()
+        if not df_sektor.empty and df_sektor[['Kerusakan (Rp)', 'Kerugian (Rp)']].notna().any().any():
+            st.plotly_chart(estimate_bar(df_sektor, 'Sektor', 'Estimasi Kerusakan & Kerugian per Sektor'), use_container_width=True)
         else:
-            st.info('Grafik sektor menunggu data input.')
-        
+            st.info('Grafik sektor menunggu data input dengan nilai estimasi.')
+
     with c2:
-        # Pie Chart Plotly
-        if total_rows and 'Tingkat_Kerusakan' in df_terbaru:
-            df_pie = df_terbaru["Tingkat_Kerusakan"].value_counts().rename_axis("Tingkat").reset_index(name="Jumlah")
-            fig_pie = px.pie(df_pie, values="Jumlah", names="Tingkat", title="Distribusi Tingkat Kerusakan", hole=0.4, color="Tingkat", color_discrete_map={"Berat":"#ef4444", "Sedang":"#f59e0b", "Ringan":"#10b981"})
-            fig_pie.update_layout(plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)", font_color="#e2e8f0", title_font_family="Space Mono")
-            st.plotly_chart(fig_pie, use_container_width=True)
+        if total_rows:
+            df_pie = df_terbaru['_tingkat'].value_counts().rename_axis('Tingkat').reset_index(name='Jumlah')
+            fig_pie = px.pie(
+                df_pie, values='Jumlah', names='Tingkat', title='Distribusi Tingkat Kerusakan', hole=0.4,
+                color='Tingkat', color_discrete_map=SEVERITY_COLORS, category_orders={'Tingkat': SEVERITY_LEVELS},
+            )
+            st.plotly_chart(style_chart(fig_pie), use_container_width=True)
         else:
             st.info('Distribusi tingkat kerusakan menunggu data input.')
 
     # Charts Row 2
-    c3, c4 = st.columns([2, 1])
+    c3, c4 = st.columns(2)
     with c3:
-        if date_column and total_rows:
-            df_tren = df_terbaru.copy()
-            df_tren['_bulan'] = pd.to_datetime(df_tren[date_column], errors='coerce', dayfirst=True).dt.to_period('M').astype(str)
-            df_tren = df_tren.dropna(subset=['_estimasi_kerusakan_numeric'])
-            df_tren = df_tren.groupby('_bulan')['_estimasi_kerusakan_numeric'].sum().reset_index(name='Estimasi Kerusakan (Rp)')
-            if not df_tren.empty:
-                fig_line = px.line(df_tren, x='_bulan', y='Estimasi Kerusakan (Rp)', title='Tren Estimasi Kerusakan Bulanan', markers=True, color_discrete_sequence=['#4a90e2'])
-                fig_line.update_layout(plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)", font_color="#e2e8f0", title_font_family="Space Mono")
-                st.plotly_chart(fig_line, use_container_width=True)
-            else:
-                st.info('Belum ada nilai estimasi bertanggal untuk grafik tren.')
+        df_wilayah = summarize_estimates(df_terbaru, '_wilayah').rename(columns={'_wilayah': 'Kabupaten/Kota'}) if total_rows else pd.DataFrame()
+        if not df_wilayah.empty and df_wilayah[['Kerusakan (Rp)', 'Kerugian (Rp)']].notna().any().any():
+            st.plotly_chart(estimate_bar(df_wilayah, 'Kabupaten/Kota', 'Estimasi per Kabupaten/Kota', horizontal=True), use_container_width=True)
         else:
-            st.info('Grafik tren memerlukan kolom tanggal kejadian dan nilai estimasi.')
-        
+            st.info('Grafik wilayah menunggu data input dengan nilai estimasi.')
+
     with c4:
-        st.markdown("#### Realisasi Bantuan per Sektor", unsafe_allow_html=True)
-        st.info('Unggah kolom realisasi bantuan untuk menampilkan progres. Tidak ada nilai progres demo yang digunakan.')
+        if total_rows:
+            df_jenis = (
+                df_terbaru.groupby(['_jenis', '_tingkat']).size().reset_index(name='Jumlah Data')
+                .rename(columns={'_jenis': 'Jenis Kejadian', '_tingkat': 'Tingkat'})
+            )
+            top_jenis = df_jenis.groupby('Jenis Kejadian')['Jumlah Data'].sum().nlargest(10).index
+            fig_jenis = px.bar(
+                df_jenis[df_jenis['Jenis Kejadian'].isin(top_jenis)], y='Jenis Kejadian', x='Jumlah Data',
+                color='Tingkat', orientation='h', title='Jenis Kejadian Terbanyak (maks. 10)',
+                color_discrete_map=SEVERITY_COLORS, category_orders={'Tingkat': SEVERITY_LEVELS},
+            )
+            fig_jenis.update_yaxes(categoryorder='total ascending')
+            st.plotly_chart(style_chart(fig_jenis), use_container_width=True)
+        else:
+            st.info('Grafik jenis kejadian menunggu data input.')
+
+    # Charts Row 3
+    if date_column and total_rows:
+        df_tren = df_terbaru.assign(
+            _bulan=pd.to_datetime(df_terbaru[date_column], errors='coerce', dayfirst=True).dt.to_period('M'),
+            _kerusakan=pd.to_numeric(df_terbaru['_estimasi_kerusakan_numeric'], errors='coerce'),
+            _kerugian=pd.to_numeric(df_terbaru['_kerugian_unit_numeric'], errors='coerce'),
+        ).dropna(subset=['_bulan'])
+        df_tren = df_tren.groupby('_bulan').agg(
+            **{'Jumlah Kejadian': ('_bulan', 'size'),
+               'Kerusakan (Rp)': ('_kerusakan', lambda values: values.sum(min_count=1)),
+               'Kerugian (Rp)': ('_kerugian', lambda values: values.sum(min_count=1))}
+        ).reset_index()
+        if not df_tren.empty:
+            df_tren['Bulan'] = df_tren['_bulan'].astype(str)
+            fig_line = px.line(
+                df_tren.melt(id_vars=['Bulan', 'Jumlah Kejadian'], value_vars=['Kerusakan (Rp)', 'Kerugian (Rp)'],
+                             var_name='Komponen', value_name='Nilai (Rp)'),
+                x='Bulan', y='Nilai (Rp)', color='Komponen', markers=True, hover_data={'Jumlah Kejadian': True},
+                title='Tren Bulanan Estimasi Kerusakan & Kerugian', color_discrete_map=estimate_colors,
+            )
+            st.plotly_chart(style_chart(fig_line), use_container_width=True)
+        else:
+            st.info(f'Kolom tanggal "{date_column}" tidak berisi tanggal yang terbaca untuk grafik tren.')
+    elif total_rows:
+        st.info('Grafik tren memerlukan kolom tanggal (mis. "Tanggal Kejadian") pada data input.')
             
     st.markdown("<br>", unsafe_allow_html=True)
     
@@ -440,31 +550,44 @@ with tab2:
         st.markdown("#### Filter Map")
         filter_peta = st.radio("Tingkat Kerusakan", ["Semua", "Berat", "Sedang", "Ringan"])
 
-        st.markdown("<br>", unsafe_allow_html=True)
-        # Keep the chart and map based on the same active input rows.
-        map_source = df_terbaru[df_terbaru["Kabupaten"].isin(kab_filter)].copy()
-        df_kab = (
-            map_source["Kabupaten"]
-            .value_counts()
-            .reindex(KABUPATEN, fill_value=0)
-            .rename_axis("Kabupaten")
-            .reset_index(name="Jumlah Kasus")
-        )
-        df_kab = df_kab.sort_values("Jumlah Kasus", ascending=True)
-        fig_kab = px.bar(df_kab, y="Kabupaten", x="Jumlah Kasus", orientation='h', title="Total Kasus per Kab/Kota", color_discrete_sequence=["#2563eb"])
-        fig_kab.update_layout(plot_bgcolor="rgba(255,255,255,0)", paper_bgcolor="rgba(255,255,255,0)", font_color="#0f172a", margin=dict(l=0, r=0, t=30, b=0), height=400)
-        st.plotly_chart(fig_kab, use_container_width=True)
+        # Grafik dan peta memakai baris aktif + filter tingkat yang sama.
+        map_source = df_terbaru if filter_peta == "Semua" else df_terbaru[df_terbaru['_tingkat'] == filter_peta]
+        st.caption(f"{len(map_source):,} dari {len(df_terbaru):,} baris aktif ditampilkan.")
+        if len(map_source):
+            df_kab = summarize_estimates(map_source, '_wilayah').rename(columns={'_wilayah': 'Kabupaten/Kota'})
+            df_kab = df_kab.sort_values('Jumlah Data')
+            fig_kab = px.bar(
+                df_kab, y='Kabupaten/Kota', x='Jumlah Data', orientation='h', title='Jumlah Data per Kab/Kota',
+                hover_data={'Kerusakan (Rp)': ':,.0f', 'Kerugian (Rp)': ':,.0f'},
+                color_discrete_sequence=[SEVERITY_COLORS.get(filter_peta, '#4a90e2')],
+            )
+            fig_kab.update_layout(margin=dict(l=0, r=0, t=30, b=0))
+            st.plotly_chart(style_chart(fig_kab, height=400), use_container_width=True)
+            st.markdown(f"**Kerusakan:** {format_rupiah(pd.to_numeric(map_source['_estimasi_kerusakan_numeric'], errors='coerce').sum())}")
+            st.markdown(f"**Kerugian:** {format_rupiah(pd.to_numeric(map_source['_kerugian_unit_numeric'], errors='coerce').sum())}")
+        else:
+            st.info('Tidak ada data untuk filter ini.')
 
     with col_map1:
+        def cell(row, column):
+            value = row.get(column)
+            return None if value is None or pd.isna(value) or str(value).strip() == '' else value
+
         map_data = [
             {
-                'id': row.get('ID Laporan', f'DALA-{index + 1:02d}'),
-                'asset': row.get('Aset', 'Aset terdampak'),
-                'location': row.get('Kabupaten', 'Lokasi tidak diketahui'),
-                'sector': row.get('Sektor', 'Lainnya'),
-                'cost': row.get('Estimasi Kerugian (Juta)', 0),
-                'damage_level': row.get('Tingkat_Kerusakan', 'Sedang'),
-                'disaster_type': row.get('Jenis Kejadian / Bencana', 'Tidak diketahui'),
+                'id': cell(row, 'ID Laporan') or f'DALA-{index + 1:02d}',
+                'asset': cell(row, 'Aset') or cell(row, 'Jenis Kejadian / Bencana') or 'Aset terdampak',
+                'location': row['_wilayah'],
+                'kabupaten': row['_wilayah'] if row['_wilayah'] != UNKNOWN_LABEL else '',
+                'kecamatan': cell(row, 'Kecamatan') or '',
+                'desa': cell(row, 'Desa') or '',
+                'latitude': cell(row, 'Latitude'),
+                'longitude': cell(row, 'Longitude'),
+                'sector': row['_sektor'],
+                'damage_level': row['_tingkat'] if row['_tingkat'] != 'Belum diklasifikasikan' else '',
+                'disaster_type': row['_jenis'],
+                'asset_damage_est': cell(row, '_estimasi_kerusakan_numeric'),
+                'economic_loss_est': cell(row, '_kerugian_unit_numeric'),
             }
             for index, (_, row) in enumerate(map_source.iterrows())
         ]
@@ -472,6 +595,11 @@ with tab2:
         from ui.components.map_view import create_location_map
         map_html = create_location_map(filter_peta, map_data)
         st.components.v1.html(map_html, height=520, scrolling=True)
+        st.caption(
+            'Warna wilayah = tingkat kerusakan dominan dari data input; arahkan kursor ke wilayah untuk melihat '
+            'jumlah data serta total estimasi kerusakan & kerugian. Titik ditampilkan bila data memiliki kolom '
+            'Latitude/Longitude. Layer kecamatan/desa terisi bila kolom Kecamatan/Desa tersedia.'
+        )
 
 # ==========================================
 # TAB 3: TAGGING FOTO
@@ -484,75 +612,69 @@ with tab3:
     with col_f1:
         st.markdown("#### 📤 Upload Dokumentasi Baru")
         uploaded_files = st.file_uploader("Pilih foto lapangan", accept_multiple_files=True, type=['png', 'jpg', 'jpeg'])
-        if uploaded_files:
-            st.success(f"✅ {len(uploaded_files)} foto berhasil diunggah!")
-            
+        uploaded_files = uploaded_files or []
+        upload_times = st.session_state.setdefault('_photo_upload_times', {})
+        photos = []
+        for photo in uploaded_files:
+            photo_key = f'{photo.name}_{photo.size}'
+            upload_times.setdefault(photo_key, datetime.now().strftime('%H:%M:%S'))
+            photos.append({
+                'key': photo_key, 'file': photo, 'name': photo.name, 'uploaded_at': upload_times[photo_key],
+                'tingkat': st.session_state.get(f'tag_tingkat_{photo_key}', 'Belum diklasifikasikan'),
+                'wilayah': st.session_state.get(f'tag_wilayah_{photo_key}', UNKNOWN_LABEL),
+                'valid': st.session_state.get(f'tag_valid_{photo_key}', False),
+            })
+        if photos:
+            st.success(f"✅ {len(photos)} foto diunggah pada sesi ini.")
+        else:
+            st.info('Belum ada foto. Unggah foto lapangan untuk ditandai wilayah dan tingkat kerusakannya.')
+
         st.markdown("---")
         st.markdown("#### ⏱️ Timeline Aktivitas")
-        df_timeline = pd.DataFrame({
-            "Waktu": ["10:30", "11:15", "13:05", "14:20"], 
-            "Aktivitas": ["Upload 5 foto (Badung)", "Validasi lokasi Karangasem", "Upload 2 foto (Denpasar)", "Sinkronisasi Data GIS"]
-        })
-        st.dataframe(df_timeline, use_container_width=True, hide_index=True)
-        
-        # Mini Pie Chart
-        df_pie_foto = pd.DataFrame({"Status": ["Tervalidasi", "Pending"], "Jumlah": [1450, 397]})
-        fig_pie_foto = px.pie(df_pie_foto, values="Jumlah", names="Status", title="Status Validasi Foto", hole=0.5, color_discrete_sequence=["#4a90e2", "#6c7a89"])
-        fig_pie_foto.update_layout(plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)", font_color="#e2e8f0", margin=dict(t=30, b=0, l=0, r=0), height=250)
-        st.plotly_chart(fig_pie_foto, use_container_width=True)
-        
+        if photos:
+            st.dataframe(
+                pd.DataFrame([
+                    {'Waktu': photo['uploaded_at'], 'Foto': photo['name'], 'Wilayah': photo['wilayah'],
+                     'Tingkat': photo['tingkat'], 'Status': 'Tervalidasi' if photo['valid'] else 'Belum divalidasi'}
+                    for photo in sorted(photos, key=lambda item: item['uploaded_at'])
+                ]),
+                use_container_width=True, hide_index=True,
+            )
+            df_pie_foto = pd.DataFrame([photo['tingkat'] for photo in photos], columns=['Tingkat']).value_counts().reset_index(name='Jumlah')
+            fig_pie_foto = px.pie(
+                df_pie_foto, values='Jumlah', names='Tingkat', title='Tag Tingkat Kerusakan Foto', hole=0.5,
+                color='Tingkat', color_discrete_map=SEVERITY_COLORS,
+            )
+            fig_pie_foto.update_layout(margin=dict(t=30, b=0, l=0, r=0))
+            st.plotly_chart(style_chart(fig_pie_foto, height=250), use_container_width=True)
+            validated = sum(photo['valid'] for photo in photos)
+            st.caption(f'{validated}/{len(photos)} foto tervalidasi.')
+        else:
+            st.caption('Aktivitas muncul setelah foto diunggah.')
+
     with col_f2:
         st.markdown("#### 📸 Galeri Foto Lapangan")
-        filter_foto = st.radio("Filter Tingkat Kerusakan:", ["Semua", "Berat", "Sedang", "Ringan"], horizontal=True)
-        st.markdown("<br>", unsafe_allow_html=True)
-        
-        # Generate 18 mock photos
-        emojis = ["🏠", "🏥", "🏫", "🌉", "🏭", "🚜", "🏪", "🛣️"]
-        mock_photos = []
-        for i in range(18):
-            tingkat = random.choice(SEVERITY)
-            mock_photos.append({
-                "id": f"IMG-{random.randint(1000,9999)}",
-                "emoji": random.choice(emojis),
-                "tingkat": tingkat,
-                "lokasi": random.choice(KABUPATEN),
-                "sektor": random.choice(SEKTOR),
-                "tanggal": f"2026-05-{random.randint(1,13):02d}",
-                "koordinat": f"-8.{random.randint(1000, 9000)}, 115.{random.randint(1000, 9000)}"
-            })
-            
-        if filter_foto != "Semua":
-            mock_photos = [p for p in mock_photos if p["tingkat"] == filter_foto]
-            
-        # Grid 3 columns
+        filter_foto = st.radio("Filter Tingkat Kerusakan:", ["Semua"] + SEVERITY_LEVELS, horizontal=True)
+        shown_photos = photos if filter_foto == "Semua" else [photo for photo in photos if photo['tingkat'] == filter_foto]
+        if photos and not shown_photos:
+            st.info('Tidak ada foto dengan tag tingkat kerusakan ini.')
+
+        region_choices = [UNKNOWN_LABEL] + sorted(set(df_terbaru['_wilayah']) - {UNKNOWN_LABEL})
         cols = st.columns(3)
-        for i, p in enumerate(mock_photos):
-            col = cols[i % 3]
-            with col:
-                badge_class = f"badge-{p['tingkat'].lower()}"
-                html_card = f"""
-                <div class="photo-card">
-                    <div class="photo-emoji">{p['emoji']}</div>
-                    <div style="text-align:center; margin-bottom:15px;">
-                        <span class="badge {badge_class}">{p['tingkat']}</span>
-                    </div>
-                    <div class="photo-details">
-                        <b>ID:</b> {p['id']}<br>
-                        <b>Lokasi:</b> {p['lokasi']}<br>
-                        <b>Sektor:</b> {p['sektor']}<br>
-                        <b>Tgl Upload:</b> {p['tanggal']}
-                    </div>
-                    <div class="photo-gps">GPS: {p['koordinat']}</div>
-                </div>
-                """
-                st.markdown(html_card, unsafe_allow_html=True)
-                
-                # Expandable details
-                with st.expander(f"Detail & Validasi ({p['id']})"):
-                    st.write(f"**Sektor**: {p['sektor']}")
-                    st.write("**Catatan Assessor**:")
-                    st.write("Kerusakan struktur utama terlihat jelas. Diperlukan evaluasi mendalam oleh tim teknis konstruksi sebelum rekonstruksi dimulai.")
-                    st.button("Validasi Data", key=f"btn_val_{p['id']}", use_container_width=True)
+        for index, photo in enumerate(shown_photos):
+            with cols[index % 3]:
+                st.image(photo['file'], use_container_width=True)
+                st.markdown(
+                    f"<span class='badge' style='color:{SEVERITY_COLORS[photo['tingkat']]}; "
+                    f"border:1px solid {SEVERITY_COLORS[photo['tingkat']]};'>{photo['tingkat']}</span> "
+                    f"<span style='font-size:0.8rem; color:#94a3b8;'>{photo['name']}</span>",
+                    unsafe_allow_html=True,
+                )
+                with st.expander('Tag & Validasi'):
+                    st.selectbox('Wilayah (dari data input)', region_choices, key=f"tag_wilayah_{photo['key']}")
+                    st.selectbox('Tingkat kerusakan', SEVERITY_LEVELS, index=SEVERITY_LEVELS.index('Belum diklasifikasikan'), key=f"tag_tingkat_{photo['key']}")
+                    st.text_area('Catatan assessor', key=f"tag_note_{photo['key']}", height=80)
+                    st.checkbox('Tervalidasi', key=f"tag_valid_{photo['key']}")
 
 # ==========================================
 # TAB 4: LLM EKSTRAKSI
@@ -652,69 +774,109 @@ with tab4:
 # ==========================================
 with tab5:
     st.markdown("### 📋 Form Pembuatan Laporan DaLA")
-    st.markdown("Isi formulir di bawah ini untuk menghasilkan dokumen laporan final Damage and Loss Assessment secara otomatis.")
-    
-    with st.form("form_laporan"):
-        col_l1, col_l2 = st.columns(2)
-        with col_l1:
-            judul_lap = st.text_input("Judul Laporan", value="Laporan Rapid Assessment DaLA Bali")
-            wilayah_lap = st.text_input("Wilayah Terdampak", value="Kabupaten Karangasem & Buleleng")
-            assessor = st.text_input("Nama Assessor Utama", value="Tim Ahli BPBD Provinsi Bali")
-        with col_l2:
-            periode_lap = st.date_input("Periode Kejadian", value=datetime.today())
-            jenis_bencana = st.selectbox("Jenis Bencana", ["Gempa Bumi", "Banjir Bandang", "Tsunami", "Tanah Longsor", "Erupsi Gunung Api"])
-            
-        st.markdown("<br>", unsafe_allow_html=True)
-        submit_btn = st.form_submit_button("Generate Laporan DaLA 📄")
-        
-    if submit_btn:
-        st.success("✅ Laporan berhasil digenerate dan siap untuk diunduh!")
-        st.balloons()
-        
-        with st.expander("👁️ Preview Dokumen Laporan Final", expanded=True):
-            st.markdown(f"<h2 style='text-align:center;'>{judul_lap}</h2>", unsafe_allow_html=True)
-            st.markdown(f"<div style='text-align:center; color:#94a3b8; margin-bottom:20px;'><b>Wilayah:</b> {wilayah_lap} | <b>Bencana:</b> {jenis_bencana} | <b>Assessor:</b> {assessor} | <b>Tanggal:</b> {periode_lap.strftime('%d %B %Y')}</div>", unsafe_allow_html=True)
-            st.markdown("---")
-            
-            st.markdown("#### 1. Executive Summary")
-            st.write("Laporan ini menyajikan hasil penilaian cepat (rapid assessment) kerusakan dan kerugian pasca bencana menggunakan metodologi Damage and Loss Assessment (DaLA). Berdasarkan pendataan lapangan dan analisis spasial, tercatat kerugian signifikan pada sektor pemukiman dan infrastruktur utama.")
-            
-            st.markdown("#### 2. Metodologi")
-            st.write("Penilaian dilakukan menggunakan pendekatan DaLA dengan panduan standar ECLAC yang disesuaikan dengan peraturan BNPB (Perka BNPB No. 15 Tahun 2011). Data diperoleh melalui tagging foto lapangan, analisis citra satelit, dan ekstraksi informasi dari laporan tingkat desa menggunakan sistem LLM lokal.")
-            
-            st.markdown("#### 3. Temuan Utama per Sektor")
-            st.write("""
-            - **Pemukiman**: Kerusakan berat pada 342 unit rumah di area episentrum bencana, mengakibatkan 1.200 jiwa mengungsi.
-            - **Infrastruktur**: Terputusnya akses jalan provinsi sepanjang 2.5 km yang mengisolasi 3 desa di Karangasem.
-            - **Ekonomi**: Kerugian pada sektor pertanian akibat rusaknya sistem irigasi subak.
-            """)
-            
-            st.markdown("#### 4. Rekomendasi Penanganan")
-            st.write("""
-            1. **Jangka Pendek**: Segera lakukan pembersihan material longsoran dan berikan bantuan logistik untuk pengungsi.
-            2. **Jangka Menengah**: Alokasikan dana darurat dan dana siap pakai untuk perbaikan infrastruktur jalan.
-            3. **Jangka Panjang**: Program rekonstruksi pemukiman dengan standar bangunan tahan gempa.
-            """)
-            
-            st.markdown("#### 5. Tabel Ringkasan Kerugian Final (Miliar Rp)")
-            df_final = pd.DataFrame({
-                "Sektor DaLA": SEKTOR,
-                "Kerusakan Fisik (Damage)": [80, 50, 30, 15, 5],
-                "Kerugian Ekonomi (Loss)": [40, 35, 15, 9, 5],
-                "Total Kebutuhan (Needs)": [120, 85, 45, 24, 10]
-            })
-            st.dataframe(df_final, use_container_width=True, hide_index=True)
-            
-            # Download Action
-            st.markdown("---")
-            csv = df_final.to_csv(index=False).encode('utf-8')
-            st.download_button(
-                label="📥 Download Data Kerugian (CSV)",
-                data=csv,
-                file_name=f'Ringkasan_DaLA_{jenis_bencana.replace(" ", "_")}.csv',
-                mime='text/csv',
-                type="primary"
-            )
+    st.markdown("Isi dan temuan laporan dihitung dari data input aktif (mengikuti filter wilayah dan periode di sidebar).")
+
+    if df_terbaru.empty:
+        st.info('Unggah CSV/XLSX pada sidebar untuk membuat laporan dari data input.')
+    else:
+        active_regions = sorted(set(df_terbaru['_wilayah']) - {UNKNOWN_LABEL})
+        disaster_options = ['Semua jenis kejadian'] + sorted(set(df_terbaru['_jenis']) - {UNKNOWN_LABEL})
+        event_dates = (
+            pd.to_datetime(df_terbaru[date_column], errors='coerce', dayfirst=True).dropna()
+            if date_column else pd.Series(dtype='datetime64[ns]')
+        )
+
+        with st.form("form_laporan"):
+            col_l1, col_l2 = st.columns(2)
+            with col_l1:
+                judul_lap = st.text_input("Judul Laporan", value="Laporan Rapid Assessment DaLA Bali")
+                wilayah_lap = st.text_input("Wilayah Terdampak", value=', '.join(active_regions) or UNKNOWN_LABEL)
+                assessor = st.text_input("Nama Assessor Utama", value="Tim Ahli BPBD Provinsi Bali")
+            with col_l2:
+                jenis_bencana = st.selectbox("Jenis Kejadian (dari data input)", disaster_options)
+                periode_default = (
+                    f"{event_dates.min():%d %B %Y} – {event_dates.max():%d %B %Y}" if len(event_dates)
+                    else datetime.today().strftime('%d %B %Y')
+                )
+                periode_lap = st.text_input("Periode Kejadian", value=periode_default)
+
+            submit_btn = st.form_submit_button("Generate Laporan DaLA 📄")
+
+        if submit_btn:
+            df_lap = df_terbaru if jenis_bencana == disaster_options[0] else df_terbaru[df_terbaru['_jenis'] == jenis_bencana]
+            lap_damage, lap_damage_count = total_numeric(df_lap, '_estimasi_kerusakan_numeric')
+            lap_loss, lap_loss_count = total_numeric(df_lap, '_kerugian_unit_numeric')
+            lap_severity = df_lap['_tingkat'].value_counts()
+            by_sector = summarize_estimates(df_lap, '_sektor').rename(columns={'_sektor': 'Sektor'})
+            by_region = summarize_estimates(df_lap, '_wilayah').rename(columns={'_wilayah': 'Kabupaten/Kota'})
+
+            with st.expander("👁️ Preview Dokumen Laporan Final", expanded=True):
+                st.markdown(f"<h2 style='text-align:center;'>{judul_lap}</h2>", unsafe_allow_html=True)
+                st.markdown(f"<div style='text-align:center; color:#94a3b8; margin-bottom:20px;'><b>Wilayah:</b> {wilayah_lap} | <b>Kejadian:</b> {jenis_bencana} | <b>Assessor:</b> {assessor} | <b>Periode:</b> {periode_lap}</div>", unsafe_allow_html=True)
+                st.markdown("---")
+
+                st.markdown("#### 1. Executive Summary")
+                st.write(
+                    f"Laporan ini merangkum {len(df_lap):,} data kejadian dari {df_lap['_wilayah'].nunique()} kabupaten/kota "
+                    f"dan {df_lap['_sektor'].nunique()} sektor. Total estimasi kerusakan {format_rupiah(lap_damage)} "
+                    f"({lap_damage_count}/{len(df_lap)} data terhitung) dan estimasi kerugian {format_rupiah(lap_loss)} "
+                    f"({lap_loss_count}/{len(df_lap)} data terhitung). Tingkat kerusakan: "
+                    + ', '.join(f"{level} {lap_severity.get(level, 0)}" for level in SEVERITY_LEVELS if lap_severity.get(level, 0)) + '.'
+                )
+
+                st.markdown("#### 2. Metodologi")
+                st.write(
+                    "Penilaian memakai pendekatan Damage and Loss Assessment (DaLA) sesuai kerangka JITUPASNA "
+                    "(Peraturan BNPB No. 5 Tahun 2017) terhadap data kejadian yang diunggah. Nilai yang diisi pada "
+                    "data input didahulukan. Bila kosong, estimasi kerusakan = Jumlah Terkena × Harga Satuan × "
+                    "Koefisien Kerusakan (Ringan 30%, Sedang 50%, Berat 100%), dengan harga acuan sektor, dan "
+                    "estimasi kerugian = 15% × kerusakan sebagai proksi. Rincian per baris ada di tab Dashboard."
+                )
+
+                st.markdown("#### 3. Temuan Utama per Sektor")
+                for _, sector_row in by_sector.iterrows():
+                    sector_rows = df_lap[df_lap['_sektor'] == sector_row['Sektor']]
+                    top_region = sector_rows['_wilayah'].value_counts().idxmax()
+                    severe = int((sector_rows['_tingkat'] == 'Berat').sum())
+                    units = f", {sector_row['Unit Terdampak']:,.0f} unit terdampak" if pd.notna(sector_row['Unit Terdampak']) else ''
+                    st.markdown(
+                        f"- **{sector_row['Sektor']}**: {sector_row['Jumlah Data']:,} data{units}, {severe} rusak berat; "
+                        f"kerusakan {format_rupiah(sector_row['Kerusakan (Rp)'] if pd.notna(sector_row['Kerusakan (Rp)']) else None)}, "
+                        f"kerugian {format_rupiah(sector_row['Kerugian (Rp)'] if pd.notna(sector_row['Kerugian (Rp)']) else None)}; "
+                        f"terbanyak di {top_region}."
+                    )
+
+                st.markdown("#### 4. Prioritas Penanganan (berdasarkan data)")
+                severe_regions = df_lap[df_lap['_tingkat'] == 'Berat']['_wilayah'].value_counts().head(3)
+                top_damage_regions = by_region.dropna(subset=['Kerusakan (Rp)']).nlargest(3, 'Kerusakan (Rp)')
+                top_sectors = by_sector.dropna(subset=['Total Kerusakan + Kerugian (Rp)']).nlargest(3, 'Total Kerusakan + Kerugian (Rp)')
+                priorities = []
+                if not severe_regions.empty:
+                    priorities.append('**Tanggap darurat**: wilayah dengan kerusakan berat terbanyak — '
+                                      + ', '.join(f'{region} ({count})' for region, count in severe_regions.items()) + '.')
+                if not top_damage_regions.empty:
+                    priorities.append('**Alokasi pemulihan**: wilayah dengan estimasi kerusakan terbesar — '
+                                      + ', '.join(f"{row['Kabupaten/Kota']} ({format_rupiah(row['Kerusakan (Rp)'])})" for _, row in top_damage_regions.iterrows()) + '.')
+                if not top_sectors.empty:
+                    priorities.append('**Rehabilitasi-rekonstruksi**: sektor dengan total kerusakan + kerugian terbesar — '
+                                      + ', '.join(f"{row['Sektor']} ({format_rupiah(row['Total Kerusakan + Kerugian (Rp)'])})" for _, row in top_sectors.iterrows()) + '.')
+                st.markdown('\n'.join(f'{number}. {text}' for number, text in enumerate(priorities, start=1)) or 'Belum ada data yang cukup untuk menentukan prioritas.')
+
+                st.markdown("#### 5. Tabel Ringkasan Kerusakan & Kerugian per Sektor (Rp)")
+                money_format = {column: st.column_config.NumberColumn(format='localized') for column in (
+                    'Kerusakan (Rp)', 'Kerugian (Rp)', 'Total Kerusakan + Kerugian (Rp)')}
+                st.dataframe(by_sector, use_container_width=True, hide_index=True, column_config=money_format)
+                st.markdown("#### 6. Ringkasan per Kabupaten/Kota (Rp)")
+                st.dataframe(by_region, use_container_width=True, hide_index=True, column_config=money_format)
+
+                st.markdown("---")
+                st.download_button(
+                    label="📥 Download Ringkasan per Sektor (CSV)",
+                    data=by_sector.to_csv(index=False).encode('utf-8'),
+                    file_name=f'Ringkasan_DaLA_{jenis_bencana.replace(" ", "_")}.csv',
+                    mime='text/csv',
+                    type="primary"
+                )
 
 # ==========================================
 # REALTIME CLOCK INJECTION

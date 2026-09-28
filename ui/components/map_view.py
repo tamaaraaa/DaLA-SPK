@@ -1,5 +1,6 @@
 import csv
 import base64
+import html
 import json
 import mimetypes
 import os
@@ -237,8 +238,8 @@ def _prepare_locations_for_map(data=None, filter_level='Semua'):
                 'cost': item.get('cost', '0'),
                 'incident_count': item.get('incident_count', item.get('jumlah_bencana', '1')),
                 'affected_quantity': item.get('affected_quantity', item.get('jumlah_terdampak', '')),
-                'asset_damage_est': item.get('asset_damage_est', '0'),
-                'economic_loss_est': item.get('economic_loss_est', '0'),
+                'asset_damage_est': item.get('asset_damage_est'),
+                'economic_loss_est': item.get('economic_loss_est'),
                 'sev': sev,
                 'photo': item.get('photo', ''),
                 'description': item.get('evidence', item.get('description', 'Tidak ada keterangan kerusakan')),
@@ -430,6 +431,21 @@ def _dominant_severity(severity_counts):
     return dominant[0] if len(dominant) == 1 else 'Campuran'
 
 
+def _estimate_amount(value):
+    """Nilai estimasi numerik; kosong/tidak valid dianggap tidak tersedia (None), bukan 0."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        amount = float(value)
+    except (TypeError, ValueError):
+        return None
+    return amount if amount == amount and amount not in (float('inf'), float('-inf')) else None
+
+
+def _format_rupiah(amount):
+    return f"Rp {int(round(amount)):,}".replace(',', '.') if amount is not None else 'Tidak tersedia'
+
+
 def _build_boundary_values(boundary, locations, level):
     severity_labels = ('Tidak ada kejadian', 'Tidak terdampak', 'Ringan', 'Sedang', 'Berat', 'Tidak ada data')
     if level == 'Kabupaten/Kota':
@@ -442,6 +458,7 @@ def _build_boundary_values(boundary, locations, level):
     feature_entries = []
     boundary_index = {}
     values = {}
+    totals = {}
     for feature in boundary.get('features', []):
         properties = feature.get('properties', {})
         boundary_id = _boundary_identifier(feature, level)
@@ -451,19 +468,27 @@ def _build_boundary_values(boundary, locations, level):
         ))
         boundary_index[key] = boundary_id
         values[boundary_id] = dict.fromkeys(severity_labels, 0)
+        totals[boundary_id] = {'damage': None, 'loss': None}
         feature_entries.append((feature, boundary_id, _geometry_bounds(feature.get('geometry'))))
+
+    def add(boundary_id, item):
+        values[boundary_id][item['sev']] += 1
+        for total_key, item_key in (('damage', 'asset_damage_est'), ('loss', 'economic_loss_est')):
+            amount = _estimate_amount(item.get(item_key))
+            if amount is not None:
+                totals[boundary_id][total_key] = (totals[boundary_id][total_key] or 0) + amount
 
     for item in locations:
         parts = _location_parts(item)
         key = tuple(parts[field] for field in key_fields)
         boundary_id = boundary_index.get(key) if all(key) else None
         if boundary_id is not None:
-            values[boundary_id][item['sev']] += 1
+            add(boundary_id, item)
             continue
 
         for feature, boundary_id, bounds in feature_entries:
             if _matches_boundary_point(item, feature, bounds):
-                values[boundary_id][item['sev']] += 1
+                add(boundary_id, item)
 
     values = {
         boundary_id: {
@@ -471,6 +496,8 @@ def _build_boundary_values(boundary, locations, level):
             'severity': _severity_rank(_dominant_severity(severity_counts)),
             'dominant_severity': _dominant_severity(severity_counts),
             'severity_counts': severity_counts,
+            'damage_total': totals[boundary_id]['damage'],
+            'loss_total': totals[boundary_id]['loss'],
         }
         for boundary_id, severity_counts in values.items()
     }
@@ -495,6 +522,8 @@ def _add_boundary_layer(m, level, locations):
                 f'{severity}: {value.get("severity_counts", {}).get(severity, 0)}'
                 for severity in ('Berat', 'Sedang', 'Ringan', 'Tidak terdampak', 'Tidak ada kejadian')
             ),
+            '_map_damage': _format_rupiah(value.get('damage_total')),
+            '_map_loss': _format_rupiah(value.get('loss_total')),
         })
 
     def style_function(feature):
@@ -517,14 +546,48 @@ def _add_boundary_layer(m, level, locations):
         style_function=style_function,
         highlight_function=highlight_function,
         tooltip=folium.GeoJsonTooltip(
-            fields=['_map_name', '_map_severity', '_map_count', '_map_breakdown'],
-            aliases=['Wilayah', 'Klasifikasi dominan', 'Jumlah data input', 'Rincian tingkat kerusakan'],
+            fields=['_map_name', '_map_severity', '_map_count', '_map_breakdown', '_map_damage', '_map_loss'],
+            aliases=[
+                'Wilayah', 'Klasifikasi dominan', 'Jumlah data input', 'Rincian tingkat kerusakan',
+                'Estimasi kerusakan', 'Estimasi kerugian',
+            ],
             labels=True,
             localize=True,
             sticky=False,
             style='background-color: white; color: #0f172a; font-family: Arial; font-size: 12px; padding: 8px;',
         ),
     ).add_to(m)
+
+
+def _add_point_layer(m, locations):
+    """Titik kejadian untuk baris input yang memiliki koordinat latitude/longitude."""
+    points = [item for item in locations if item['lat'] is not None and item['lon'] is not None]
+    if not points:
+        return
+    layer = folium.FeatureGroup(name=f'Titik kejadian ({len(points)})')
+    for item in points:
+        popup_html = '<br>'.join(html.escape(str(line)) for line in (
+            f"{item.get('id')} · {item.get('asset')}",
+            f"Wilayah: {', '.join(part for part in (item.get('desa'), item.get('kecamatan'), item.get('kabupaten')) if part)}",
+            f"Sektor: {item.get('sec')}",
+            f"Kejadian: {item.get('disaster_type')}",
+            f"Tingkat kerusakan: {item.get('sev')}",
+            f"Estimasi kerusakan: {_format_rupiah(_estimate_amount(item.get('asset_damage_est')))}",
+            f"Estimasi kerugian: {_format_rupiah(_estimate_amount(item.get('economic_loss_est')))}",
+        ))
+        color = SEVERITY_PALETTE.get(item.get('sev'), SEVERITY_PALETTE['Campuran'])
+        folium.CircleMarker(
+            location=[item['lat'], item['lon']],
+            radius=6,
+            color='#0f172a',
+            weight=1,
+            fill=True,
+            fill_color=color,
+            fill_opacity=0.9,
+            popup=folium.Popup(popup_html, max_width=320),
+            tooltip=html.escape(str(item.get('asset'))),
+        ).add_to(layer)
+    layer.add_to(m)
 
 
 def build_geojson(data=None, filter_level='Semua'):
@@ -616,6 +679,7 @@ def create_location_map(filter_level='Semua', data=None):
     _add_boundary_layer(m, 'Kabupaten/Kota', locations_to_plot)
     _add_boundary_layer(m, 'Kecamatan', locations_to_plot)
     _add_boundary_layer(m, 'Desa', locations_to_plot)
+    _add_point_layer(m, locations_to_plot)
 
     legend_html = f"""
     <div style="position: fixed; bottom: 20px; right: 20px; z-index: 9999; background: rgba(15, 23, 42, 0.88); color: white; border-radius: 12px; padding: 12px 14px; font-family: Arial, sans-serif; font-size: 12px; border: 1px solid rgba(148, 163, 184, 0.3); box-shadow: 0 10px 25px rgba(15, 23, 42, 0.25);">
