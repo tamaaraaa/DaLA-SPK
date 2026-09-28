@@ -158,6 +158,12 @@ h1, h2, h3, h4, h5, h6 {
 # ==========================================
 # MOCK DATA
 # ==========================================
+def display_frame(dataframe):
+    """Nama kolom siap tampil; salinan internal yang namanya bentrok dengan kolom asli input dibuang."""
+    renamed = dataframe.rename(columns={'Tingkat_Kerusakan': 'Tingkat Kerusakan'})
+    return renamed.loc[:, ~renamed.columns.duplicated()]
+
+
 KABUPATEN = ["Denpasar", "Badung", "Gianyar", "Tabanan", "Buleleng", "Karangasem", "Klungkung", "Bangli", "Jembrana"]
 SEKTOR = ["Pemukiman", "Infrastruktur", "Ekonomi", "Sosial", "Lintas Sektor"]
 SEVERITY = ["Berat", "Sedang", "Ringan"]
@@ -355,7 +361,7 @@ Baris yang datanya belum lengkap tidak dianggap Rp 0; alasannya tercantum di kol
                 ) if column in df_terbaru.columns
             ]
             st.dataframe(
-                df_terbaru[breakdown_columns].rename(columns={'Tingkat_Kerusakan': 'Tingkat Kerusakan'}),
+                display_frame(df_terbaru[breakdown_columns]),
                 use_container_width=True,
                 hide_index=True,
                 column_config={
@@ -418,7 +424,7 @@ Baris yang datanya belum lengkap tidak dianggap Rp 0; alasannya tercantum di kol
     
     # Table
     st.markdown("#### Data Kerusakan Terbaru")
-    display_df_terbaru = df_terbaru.rename(columns={"Tingkat_Kerusakan": "Tingkat Kerusakan"})
+    display_df_terbaru = display_frame(df_terbaru)
     internal_columns = [column for column in display_df_terbaru.columns if str(column).startswith('_')]
     st.dataframe(display_df_terbaru.drop(columns=internal_columns), use_container_width=True)
 
